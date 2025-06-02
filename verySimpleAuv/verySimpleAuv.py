@@ -8,8 +8,8 @@ import numpy as np
 import pandas
 import warnings
 import collections
-import gym
-from gym.utils import seeding
+import gymnasium as gym
+from gymnasium.utils import seeding
 
 import os
 
@@ -112,7 +112,6 @@ class AuvEnv(gym.Env):
 
 		# Observation space.
 		lenState = 9 + 2
-		# lenState = 6 + 2
 		self.observation_space = gym.spaces.Box(
 			-1*np.ones(lenState, dtype=np.float32),
 			np.ones(lenState, dtype=np.float32),
@@ -121,9 +120,6 @@ class AuvEnv(gym.Env):
 	def dataToState(self, pos, heading, velocities):
 		# Non-dimensionalise the position error (unit vector towards the target).
 		perr = self.positionTarget - pos
-		# NOTE for arbitrary motion this would need to be scaled and clipped to <-1, 1/0>
-		# dTarget = np.linalg.norm(perr)
-		# perr /= max(1e-6, dTarget)
 
 		# Get heading error by comparing on both sides of zero.
 		herr = headingError(self.headingTarget, heading)
@@ -133,8 +129,6 @@ class AuvEnv(gym.Env):
 			self.herr_o = herr
 			self.perr_o = perr
 
-		# Basic controller needs the first three elements to stay as they are now.
-		
 		# V0 - original as used in the paper.
 		# newState = np.concatenate([
 		#	 np.array([
@@ -148,7 +142,7 @@ class AuvEnv(gym.Env):
 		#	 np.clip(velocities/[0.2, 0.2, 30./180.*np.pi], -1., 1.),
 		#	 np.zeros(2),  # Placeholder for additional state variables used only in CFD
 		# ])
-
+		
 		# V1 - alternative with all the changes mentioned by the reviewer.
 		# newState = np.concatenate([
 		#	 np.array([
@@ -187,7 +181,9 @@ class AuvEnv(gym.Env):
 
 		return newState
 
-	def reset(self, keepTimeHistory=False, applyNoise=True, fixedInitialValues=None):
+	def reset(self, *, seed=None, options=None, keepTimeHistory=False, applyNoise=True, fixedInitialValues=None):
+		if seed is not None:
+			self.seed = seed
 		if self.seed is not None:
 			self._np_random, self.seed = seeding.np_random(self.seed)
 
@@ -215,7 +211,7 @@ class AuvEnv(gym.Env):
 		self.positionTarget = np.zeros(2)
 		self.headingStart = self.heading
 
-		# random initial time in the first 25% of flow data.
+		# Random initial time in the first 25% of flow data.
 		self.flowDataTimeOffset = np.random.rand()*self.flow.time[self.flow.time.shape[0]//4]
 
 		# Used for checking action history in the reward.
@@ -233,17 +229,15 @@ class AuvEnv(gym.Env):
 		# Get the initial state.
 		self.state = self.dataToState(self.position, self.heading, self.velocities)
 
-		return self.state
+		return self.state, {}
 
 	def step(self, action):
 		# Set new time.
 		self.iStep += 1
 		self.time += self.dt
 
-		# Check if max episode length reached.
+		# Initialize done flag.
 		done = False
-		if self.iStep >= self._max_episode_steps:
-			done = True
 
 		# Store the actions.
 		self.recentActions.appendleft(action)
@@ -272,8 +266,6 @@ class AuvEnv(gym.Env):
 		velRel = np.dot(invJtransform[:-1, :-1], self.velocities[:2] - velCurrent)
 
 		# Compute hydrodynamic forces and moments in the vehicle reference frame.
-		# NOTE: this is a very simplified problem definition, ignoring rigid body
-		#   accelerations and cross-coupling terms.
 		Fhydro = np.array([
 			(self.Xu*self.XuMult + self.Xuu*self.XuuMult*np.abs(velRel[0]))*velRel[0],
 			(self.Yv*self.YvMult + self.Yvv*self.YvvMult*np.abs(velRel[1]))*velRel[1],
@@ -284,7 +276,6 @@ class AuvEnv(gym.Env):
 		Fhydro = np.dot(Jtransform, Fhydro)
 
 		# Vector of accelerations in the global reference frame.
-		# NOTE: this ignores added mass and inertia due to fluid accelerations.
 		accelerations = np.array([
 			(Fhydro[0]+Fset[0])/(self.m*self.mMult),
 			(Fhydro[1]+Fset[1])/(self.m*self.mMult),
@@ -341,12 +332,11 @@ class AuvEnv(gym.Env):
 			np.exp(-5.*np.linalg.norm(perr)),
 			np.exp(-0.1*np.abs(herr/np.pi*180.)) if np.abs(herr) < np.pi/2. else -np.exp(-0.1*(180. - np.abs(herr/np.pi*180.))),
 			np.exp(-0.6*rmsAc),
-
+			
 			# Additional term which encourages as little actuation as possible.
-			# np.exp(-5.*np.sum(np.abs(action))/len(action)),
+			# np.exp(-5.*np.sum(np.abs(action))/len(action)),			
 			-0.1*np.sum(action**2.)/len(action),
-
-			# ---
+			
 			# Additional bonuses or penalties.
 			bonus,
 		])
@@ -381,7 +371,9 @@ class AuvEnv(gym.Env):
 		else:
 			self.steps_beyond_done = 0
 
-		return self.state, reward, done, {}
+		terminated = done
+		truncated = self.iStep >= self._max_episode_steps
+		return self.state, reward, terminated, truncated, {}
 
 	def render(self, mode="human"):
 		pass
@@ -395,12 +387,10 @@ def make_env(rank, seed=0, env_kwargs={}):
 	Utility function for multiprocessed env.
 
 	:param filename: (str) path to file from which the env is created
-	:param seed: (int) the inital seed for RNG
+	:param seed: (int) the initial seed for RNG
 	:param rank: (int) index of the subprocess
 	"""
 	def _init():
 		env = AuvEnv(seed=seed+rank, **env_kwargs)
-		# env.seed(seed + rank)
-		# env.reset(seed=seed+rank)
 		return env
 	return _init
