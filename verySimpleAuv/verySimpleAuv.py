@@ -240,8 +240,8 @@ class AuvEnv(gym.Env):
 	def reward_clean(self, perr, herr, action, bonus, rmsAc):
 		d     = np.linalg.norm(perr)
 		dpsi  = abs(herr)
-		d_d   = self.prev_d    - d
-		d_h   = self.prev_dpsi - dpsi
+		d_d = np.clip(self.prev_d - d,  -1.0, 1.0)
+		d_h = np.clip(self.prev_dpsi - dpsi, -1.0, 1.0)
 		E_pen = self.cfg["E_lambda"] * np.mean(np.abs(action))
 
 		rewardTerms = np.array([
@@ -305,10 +305,6 @@ class AuvEnv(gym.Env):
 		# Used for checking action history in the reward.
 		self.recentActions = collections.deque(10*[None], 10)
 
-		# Previous error terms
-		self.prev_d    = np.inf
-		self.prev_dpsi = np.inf
-
 		# Other stuff.
 		self.velocities = np.zeros(3)
 		self.time = 0
@@ -320,6 +316,11 @@ class AuvEnv(gym.Env):
 
 		# Get the initial state.
 		self.state = self.state_fn(self.position, self.heading, self.velocities)
+
+		# Previous error terms
+		perr0 = np.linalg.norm(self.positionTarget - self.position)
+		herr0 = abs(headingError(self.headingTarget, self.heading))
+		self.prev_d, self.prev_dpsi = perr0, herr0
 
 		return self.state, {}
 
