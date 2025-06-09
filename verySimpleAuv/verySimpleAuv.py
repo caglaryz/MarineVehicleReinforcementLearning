@@ -48,10 +48,23 @@ class PDController(object):
 		return np.clip(actions, -1., 1.), states
 
 class AuvEnv(gym.Env):
-	def __init__(self, seed=None, dt=0.02, noiseMagCoeffs=0.0, noiseMagActuation=0.0,
-				 currentVelScale=1.0, currentTurbScale=2.0, stopOnBoundsExceeded=True):
+	def __init__(self, 
+			  seed=None, 
+			  dt=0.02, 
+			  noiseMagCoeffs=0.0, 
+			  noiseMagActuation=0.0,
+			  currentVelScale=1.0,
+			  currentTurbScale=2.0, 
+			  stopOnBoundsExceeded=True,
+			  state_version="legacy",
+			  reward_version="legacy"):
 		# Call base class constructor.
 		super(AuvEnv, self).__init__()
+
+		# Add state and reward version selection by user.
+		self.state_version  = state_version
+		self.reward_version = reward_version
+		
 		self.seed = seed
 
 		# Tied to the no. time values stored in the turbulence data set.
@@ -111,13 +124,56 @@ class AuvEnv(gym.Env):
 										   shape=(self.lenAction,), dtype=np.float32)
 
 		# Observation space.
-		lenState = 9 + 2
+		lenState = 11
 		self.observation_space = gym.spaces.Box(
 			-1*np.ones(lenState, dtype=np.float32),
 			np.ones(lenState, dtype=np.float32),
 			shape=(lenState,))
+		
+		# Control and RL specific scales & weights dict.
+		# This one can be subjected to a hyperparameter sweep
+		self.cfg = dict(
+    		L_ref = 0.50,                 		# [m] length used to non-dim pos-error
+    		U_ref = 0.30,                 		# [m/s] surge/sway reference speed
+    		R_ref = np.deg2rad(45),       		# [rad/s] yaw-rate reference
+    		F_ref = 150.0,                		# [N]   hydrodynamic force scale
+    		E_lambda = 0.05,              		# reward weight for mean|τ|
+    		success_tol_pos = 0.05,       		# [m]   success radius
+    		success_tol_head = np.deg2rad(10),  # [rad] success heading error
+		)
 
-	def dataToState(self, pos, heading, velocities):
+	def state_clean(self, pos, heading, velocities):
+		cfg  = self.cfg
+		# 1. heading error pair
+		dpsi = headingError(self.headingTarget, heading)   # already in (−π,π)
+		sin_h, cos_h = np.sin(dpsi), np.cos(dpsi)
+		
+		# 2. body-frame position error
+		ex, ey = self.positionTarget - pos
+		c, s = np.cos(heading), np.sin(heading)
+		ef =  c*ex + s*ey
+		es = -s*ex + c*ey
+		ef_n = np.clip(ef / cfg["L_ref"], -1., 1.)
+		es_n = np.clip(es / cfg["L_ref"], -1., 1.)
+
+		# 3. body-frame velocities (rotate inertial to body)
+		u_i, v_i, r_i = velocities
+		u_b =  c*u_i + s*v_i
+		v_b = -s*u_i + c*v_i
+		u_n = np.clip(u_b / cfg["U_ref"], -1., 1.)
+		v_n = np.clip(v_b / cfg["U_ref"], -1., 1.)
+		r_n = np.clip(r_i / cfg["R_ref"], -1., 1.)
+
+		# 4. Forces calculated by pressure sensors (zeros for now)
+		extra1 = (0., 0.)
+		
+		# 5. Extra two variables to match legacy state size
+		extra2 = (0., 0.)
+
+		return np.array([sin_h, cos_h, ef_n, es_n, u_n, v_n, r_n, *extra1, *extra2],
+				  dtype=np.float32)
+	
+	def state_legacy(self, pos, heading, velocities):
 		# Non-dimensionalise the position error (unit vector towards the target).
 		perr = self.positionTarget - pos
 
@@ -180,12 +236,44 @@ class AuvEnv(gym.Env):
 		])
 
 		return newState
+	
+	def reward_clean(self, perr, herr, action, bonus, rmsAc):
+		d     = np.linalg.norm(perr)
+		dpsi  = abs(herr)
+		d_d   = self.prev_d    - d
+		d_h   = self.prev_dpsi - dpsi
+		E_pen = self.cfg["E_lambda"] * np.mean(np.abs(action))
+
+		rewardTerms = np.array([
+			10*d_d,          # distance gain
+			2*d_h,           # heading gain
+			-E_pen,          # energy penalty
+			0.0,             # spare slot (keep structure)
+			bonus
+		])
+		self.prev_d, self.prev_dpsi = d, dpsi
+		return rewardTerms.sum(), rewardTerms
+	
+	def reward_legacy(self, perr, herr, action, bonus, rmsAc):
+		rewardTerms = np.array([
+			np.exp(-5*np.linalg.norm(perr)),
+			np.exp(-0.1*abs(herr*180/np.pi)) if abs(herr) < np.pi/2
+				else -np.exp(-0.1*(180-abs(herr*180/np.pi))),
+			np.exp(-0.6*rmsAc),
+			-0.1*np.sum(action**2)/len(action),
+			bonus
+		])
+		return rewardTerms.sum(), rewardTerms
 
 	def reset(self, *, seed=None, options=None, keepTimeHistory=False, applyNoise=True, fixedInitialValues=None):
 		if seed is not None:
 			self.seed = seed
 		if self.seed is not None:
 			self._np_random, self.seed = seeding.np_random(self.seed)
+		
+		# choose evaluation functions once per episode
+		self.state_fn = getattr(self, f"state_{self.state_version}")
+		self.reward_fn = getattr(self, f"reward_{self.reward_version}")
 
 		# Multipliers to mass, inertia and force coefficients used to improve
 		# exploration and test robustness.
@@ -217,6 +305,10 @@ class AuvEnv(gym.Env):
 		# Used for checking action history in the reward.
 		self.recentActions = collections.deque(10*[None], 10)
 
+		# Previous error terms
+		self.prev_d    = np.inf
+		self.prev_dpsi = np.inf
+
 		# Other stuff.
 		self.velocities = np.zeros(3)
 		self.time = 0
@@ -227,7 +319,7 @@ class AuvEnv(gym.Env):
 		self.timeHistory = []
 
 		# Get the initial state.
-		self.state = self.dataToState(self.position, self.heading, self.velocities)
+		self.state = self.state_fn(self.position, self.heading, self.velocities)
 
 		return self.state, {}
 
@@ -291,7 +383,7 @@ class AuvEnv(gym.Env):
 		velocities = y[3:]
 
 		# Compute state.
-		self.state = self.dataToState(position, heading, velocities)
+		self.state  = self.state_fn(position, heading, velocities)
 
 		# Compute the reward.
 		bonus = 0.
@@ -319,30 +411,7 @@ class AuvEnv(gym.Env):
 		rmsAc = np.sqrt(np.sum((rmsAc-np.mean(rmsAc, axis=0))**2., axis=0) / rmsAc.shape[0])
 		rmsAc = np.mean(rmsAc)
 
-		rewardTerms = np.array([
-			# --- ver 0 ---
-			# # Square error along all DoF
-			# -np.sum(np.clip(np.abs([perr[0], perr[1], herr])/[0.3, 0.3, 0.5*np.pi], 0., 1.)**2.),
-			# # Bonus for being close to the objective.
-			# 0.333*np.sum(np.abs([perr[0], perr[1], herr]) < [0.02, 0.02, 25./180.*np.pi]),
-			# # Penalty for actuation to encourage it to do nothing when possible.
-			# -0.05*np.sum(action**2.),
-
-			# --- inspider by Woo et al. (2019) ---
-			np.exp(-5.*np.linalg.norm(perr)),
-			np.exp(-0.1*np.abs(herr/np.pi*180.)) if np.abs(herr) < np.pi/2. else -np.exp(-0.1*(180. - np.abs(herr/np.pi*180.))),
-			np.exp(-0.6*rmsAc),
-			
-			# Additional term which encourages as little actuation as possible.
-			# np.exp(-5.*np.sum(np.abs(action))/len(action)),			
-			-0.1*np.sum(action**2.)/len(action),
-			
-			# Additional bonuses or penalties.
-			bonus,
-		])
-
-		# Get total reward.
-		reward = np.sum(rewardTerms)
+		reward, rewardTerms = self.reward_fn(perr, herr, action, bonus, rmsAc)
 
 		# Update the position and heading at the new time value.
 		self.position = position
