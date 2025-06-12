@@ -110,37 +110,85 @@ class AuvEnv(gym.Env):
 		self.action_space = gym.spaces.Box(low=-1.0, high=1.0,
 										   shape=(self.lenAction,), dtype=np.float32)
 
-		# Observation space.
-		lenState = 9 + 2
+		# Observation space (modified due to less state variables).
+		lenState = 7 + 2
 		self.observation_space = gym.spaces.Box(
 			-1*np.ones(lenState, dtype=np.float32),
 			np.ones(lenState, dtype=np.float32),
 			shape=(lenState,))
+		
+		# Define flag for performing success condts. for the first time:
+		# If 0, can get the bonus reward. If > 0, can't get the reward
+		self.tookFirstBonus = False
+		
+		# Control and RL specific scales & weights dict.
+		# This one can be subjected to a hyperparameter sweep
+		self.cfg = dict(
+    		L_ref = 0.50,                 		# [m] length used to non-dim pos-error
+    		U_ref = 0.30,                 		# [m/s] surge/sway reference speed
+    		R_ref = np.deg2rad(45),       		# [rad/s] yaw-rate reference
+    		F_ref = 150.0,                		# [N]   hydrodynamic force scale
+    		success_tol_pos = 0.05,       		# [m]   success radius
+    		success_tol_head = np.deg2rad(10),  # [rad] success heading error
+			k_rew_pos = 5,
+			s_rew_pos = 2,
+			k_rew_head = 4,
+			s_rew_head = 2,
+			t_rew_rmsAc = 0.2,             		# [ ]	rmsAc Treshold
+			k_rew_rmsAc = 1.115,
+		)
 
 	def dataToState(self, pos, heading, velocities):
-		# Non-dimensionalise the position error (unit vector towards the target).
-		perr = self.positionTarget - pos
+		cfg  = self.cfg
+		
+		# 1. Trigonometric heading error pair
+		dpsi = headingError(self.headingTarget, heading)
+		sin_h = np.sin(dpsi)
+		cos_h = np.cos(dpsi)
+		# This way, RL agent does not have to learn trigonometry at -
+		# discontinuities, i.e. +- pi.
 
-		# Get heading error by comparing on both sides of zero.
-		herr = headingError(self.headingTarget, heading)
+		# 2. body-frame position error
+		# we first calculate position error in inertial frame
+		ex, ey = self.positionTarget - pos
 
-		# Initialise if called just after reset.
-		if self.herr_o is None:
-			self.herr_o = herr
-			self.perr_o = perr
+		# we'll basically get forces tangent and normal to inertial heading
+		# which means body frame.
 
-		# V0 - original as used in the paper.
+		c = np.cos(heading)
+		s = np.sin(heading)
+
+		# pos error in terms of body front
+		ef = c*ex + s*ey
+		# similarly sideways pos error
+		es = -s*ex + c*ey
+
+		# 3. body frame velocities
+
+		# we'll rotate inertial velocities w/ same heading
+		u_i, v_i, r_i = velocities
+		u_b = c*u_i + s*v_i
+		v_b = -s*u_i + c*v_i
+
+		# 4. Forces calculated by pressure sensors (zeros for now)
+		extra = (0., 0.)
+
+		# VX - Custom State by Yilmaz, C., 2025
+
+		# State variables are normalized between 0 and 1.
+
 		newState = np.concatenate([
 			np.array([
-				min(1., max(-1., perr[0]/0.2)),
-				min(1., max(-1., perr[1]/0.2)),
-				min(1., max(-1., herr/(45./180.*np.pi))),
-				min(1., max(-1., (herr-self.herr_o)/(2./180*np.pi))),
-				min(1., max(-1., (perr[0]-self.perr_o[0])/0.025)),
-				min(1., max(-1., (perr[1]-self.perr_o[1])/0.025)),
+				min(1., max(-1., sin_h)),
+				min(1., max(-1., cos_h)),
+				min(1., max(-1., ef/cfg["L_ref"])),
+				min(1., max(-1., es/cfg["L_ref"])),
+				min(1., max(-1., u_b / cfg["U_ref"])),
+				min(1., max(-1., v_b / cfg["U_ref"])),
+				min(1., max(-1., r_i / cfg["R_ref"])),
+				min(1., max(-1., extra[0])),
+				min(1., max(-1., extra[1])),
 			]),
-			np.clip(velocities/[0.2, 0.2, 30./180.*np.pi], -1., 1.),
-			np.zeros(2),  # Placeholder for additional state variables used only in CFD
 		])
 
 		return newState
@@ -189,6 +237,12 @@ class AuvEnv(gym.Env):
 		self.herr_o = None
 		self.perr_o = None
 		self.timeHistory = []
+		# Also reset first time success bonus
+		self.tookFirstBonus = False
+
+		# Reset tolerances
+		self.pos_tol = self.cfg["success_tol_pos"]
+		self.head_tol = self.cfg["success_tol_head"]
 
 		# Get the initial state.
 		self.state = self.dataToState(self.position, self.heading, self.velocities)
@@ -278,31 +332,44 @@ class AuvEnv(gym.Env):
 		self.herr_o = herr
 		self.perr_o = perr
 
+		# Check if in success bounds for the first time
+		if (self.tookFirstBonus == False):
+			if (perr < self.pos_tol and herr < self.head_tol):
+				bonus += 100
+				self.tookFirstBonus == True
+
 		# Compute rms of recent actions.
 		rmsAc = np.array([x for x in self.recentActions if x is not None])
 		rmsAc = np.sqrt(np.sum((rmsAc-np.mean(rmsAc, axis=0))**2., axis=0) / rmsAc.shape[0])
 		rmsAc = np.mean(rmsAc)
 
+		# Fetch parameters from dictionary
+		a_pos = self.cfg["s_rew_pos"]
+		k_pos = self.cfg["k_rew_pos"]
+		a_head = self.cfg["s_rew_head"]
+		k_head = self.cfg["k_rew_head"]
+		k_rms = self.cfg["k_rew_rmsAc"]
+		t_rms = self.cfg["t_rew_rmsAc"]
+
+		d = np.linalg.norm(perr)
+		dpsi = abs(herr)
+
 		rewardTerms = np.array([
-			# --- ver 0 ---
-			# # Square error along all DoF
-			# -np.sum(np.clip(np.abs([perr[0], perr[1], herr])/[0.3, 0.3, 0.5*np.pi], 0., 1.)**2.),
-			# # Bonus for being close to the objective.
-			# 0.333*np.sum(np.abs([perr[0], perr[1], herr]) < [0.02, 0.02, 25./180.*np.pi]),
-			# # Penalty for actuation to encourage it to do nothing when possible.
-			# -0.05*np.sum(action**2.),
-
-			# --- inspider by Woo et al. (2019) ---
-			np.exp(-5.*np.linalg.norm(perr)),
-			np.exp(-0.1*np.abs(herr/np.pi*180.)) if np.abs(herr) < np.pi/2. else -np.exp(-0.1*(180. - np.abs(herr/np.pi*180.))),
-			np.exp(-0.6*rmsAc),
+			# Custom reward design, Yilmaz, C., 2025.
 			
-			# Additional term which encourages as little actuation as possible.
-			# np.exp(-5.*np.sum(np.abs(action))/len(action)),			
-			# -0.1*np.sum(action**2.)/len(action),
+			# position reward term
+			np.where(d <= self.pos_tol,
+				1.0 - (d / self.pos_tol) ** a_pos,
+				-k_pos * (d - self.pos_tol) / 1.365),
 
-			# I removed this reward term above since it wasn't in the article.
-			
+			# heading reward term
+			np.where(dpsi <= self.head_tol,
+				1.0 - (dpsi / self.head_tol) ** a_head,
+				-k_head * (dpsi - self.head_tol) / np.deg2rad(170)),
+
+			# excessive action/jitter penalty
+			-np.minimum(k_rms * np.maximum(0.0, rmsAc - t_rms), 1.0),
+
 			# Additional bonuses or penalties.
 			bonus,
 		])
