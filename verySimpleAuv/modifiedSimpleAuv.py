@@ -130,12 +130,12 @@ class AuvEnv(gym.Env):
     		F_ref = 150.0,                		# [N]   hydrodynamic force scale
     		success_tol_pos = 0.05,       		# [m]   success radius
     		success_tol_head = np.deg2rad(10),  # [rad] success heading error
-			k_rew_pos = 5,
-			s_rew_pos = 2,
-			k_rew_head = 4,
-			s_rew_head = 2,
-			t_rew_rmsAc = 0.2,             		# [ ]	rmsAc Treshold
-			k_rew_rmsAc = 1.115,
+		k_rew_pos = 5,
+		s_rew_pos = 2,
+		k_rew_head = 4,
+		s_rew_head = 2,
+		t_rew_rmsAc = 0.2,             		# [ ]	rmsAc Treshold
+		k_rew_rmsAc = 1.115,
 		)
 
 	def dataToState(self, pos, heading, velocities):
@@ -332,11 +332,14 @@ class AuvEnv(gym.Env):
 		self.herr_o = herr
 		self.perr_o = perr
 
+		d = np.linalg.norm(perr)
+		dpsi = abs(herr)
+
 		# Check if in success bounds for the first time
 		if (self.tookFirstBonus == False):
-			if (perr < self.pos_tol and herr < self.head_tol):
+			if (d < self.pos_tol and dpsi < self.head_tol):
 				bonus += 100
-				self.tookFirstBonus == True
+				self.tookFirstBonus = True
 
 		# Compute rms of recent actions.
 		rmsAc = np.array([x for x in self.recentActions if x is not None])
@@ -350,9 +353,6 @@ class AuvEnv(gym.Env):
 		k_head = self.cfg["k_rew_head"]
 		k_rms = self.cfg["k_rew_rmsAc"]
 		t_rms = self.cfg["t_rew_rmsAc"]
-
-		d = np.linalg.norm(perr)
-		dpsi = abs(herr)
 
 		rewardTerms = np.array([
 			# Custom reward design, Yilmaz, C., 2025.
