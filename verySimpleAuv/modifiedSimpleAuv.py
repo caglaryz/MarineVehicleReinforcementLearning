@@ -135,8 +135,7 @@ class AuvEnv(gym.Env):
 		k_rew_head = 4,
 		s_rew_head = 2,
 		t_rew_rmsAc = 0.2,             		# [ ]	rmsAc Treshold
-		k_rew_rmsAc = 1.115,
-		)
+		k_rew_rmsAc = 1.115)
 
 	def dataToState(self, pos, heading, velocities):
 		cfg  = self.cfg
